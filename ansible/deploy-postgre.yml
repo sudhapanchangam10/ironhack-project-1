@@ -1,0 +1,21 @@
+
+---
+- name: Deploy PostgreSQL on database server
+  hosts: database
+  become: true
+
+  tasks:
+    - name: Run PostgreSQL container
+      community.docker.docker_container:
+        name: postgres
+        image: postgres:15-alpine
+        state: started
+        restart_policy: unless-stopped
+        published_ports:
+          - "5432:5432"
+        env:
+          POSTGRES_USER: "postgres"
+          POSTGRES_PASSWORD: "postgres"
+          POSTGRES_DB: "postgres"
+        volumes:
+          - postgres-data:/var/lib/postgresql/data

@@ -1,3 +1,4 @@
+
 using System;
 using System.Data.Common;
 using System.Linq;
@@ -16,36 +17,37 @@ namespace Worker
         {
             try
             {
-                // Fetch configuration from environment variables
+                // Read database configuration
                 var dbHost = Environment.GetEnvironmentVariable("DB_HOST") ?? "db";
                 var dbUsername = Environment.GetEnvironmentVariable("DB_USERNAME") ?? "postgres";
                 var dbPassword = Environment.GetEnvironmentVariable("DB_PASSWORD") ?? "postgres";
                 var dbName = Environment.GetEnvironmentVariable("DB_NAME") ?? "postgres";
-                
+
+                // Read Redis configuration
                 var redisHost = Environment.GetEnvironmentVariable("REDIS_HOST") ?? "redis";
 
-                // Construct the connection strings
-                var pgConnectionString = $"Server={dbHost};Username={dbUsername};Password={dbPassword};Database={dbName}";
-                Console.WriteLine($"Database connection string: {pgConnectionString}");
+                var pgConnectionString =
+                    $"Server={dbHost};Username={dbUsername};Password={dbPassword};Database={dbName}";
+
+                Console.WriteLine($"Database connection string: Server={dbHost};Username={dbUsername};Database={dbName}");
+
                 var redisConnectionString = redisHost;
 
                 var pgsql = OpenDbConnection(pgConnectionString);
                 var redisConn = OpenRedisConnection(redisConnectionString);
                 var redis = redisConn.GetDatabase();
 
-                // Keep alive is not implemented in Npgsql yet. This workaround was recommended:
-                // https://github.com/npgsql/npgsql/issues/1214#issuecomment-235828359
                 var keepAliveCommand = pgsql.CreateCommand();
                 keepAliveCommand.CommandText = "SELECT 1";
 
                 var definition = new { vote = "", voter_id = "" };
+
                 while (true)
                 {
-                    // Slow down to prevent CPU spike, only query each 100ms
                     Thread.Sleep(100);
 
-                    // Reconnect redis if down
-                    if (redisConn == null || !redisConn.IsConnected)
+                    // Reconnect to Redis if the connection is lost
+                    if (!redisConn.IsConnected)
                     {
                         Console.WriteLine("Reconnecting Redis");
                         redisConn = OpenRedisConnection(redisConnectionString);
@@ -53,21 +55,27 @@ namespace Worker
                     }
 
                     string json = redis.ListLeftPopAsync("votes").Result;
+
                     if (json != null)
                     {
                         var vote = JsonConvert.DeserializeAnonymousType(json, definition);
+
+                        if (vote == null)
+                        {
+                            continue;
+                        }
+
                         Console.WriteLine($"Processing vote for '{vote.vote}' by '{vote.voter_id}'");
 
-                        // Reconnect DB if down
-                        if (!pgsql.State.Equals(System.Data.ConnectionState.Open))
+                        if (pgsql.State != System.Data.ConnectionState.Open)
                         {
                             Console.WriteLine("Reconnecting DB");
                             pgsql = OpenDbConnection(pgConnectionString);
+                            keepAliveCommand = pgsql.CreateCommand();
+                            keepAliveCommand.CommandText = "SELECT 1";
                         }
-                        else
-                        { // Normal +1 vote requested
-                            UpdateVote(pgsql, vote.voter_id, vote.vote);
-                        }
+
+                        UpdateVote(pgsql, vote.voter_id, vote.vote);
                     }
                     else
                     {
@@ -77,22 +85,31 @@ namespace Worker
             }
             catch (Exception ex)
             {
-                Console.Error.WriteLine(ex.ToString());
+                Console.Error.WriteLine(ex);
                 return 1;
             }
         }
 
         private static NpgsqlConnection OpenDbConnection(string connectionString)
         {
-            NpgsqlConnection connection;
-
             while (true)
             {
                 try
                 {
-                    connection = new NpgsqlConnection(connectionString);
+                    var connection = new NpgsqlConnection(connectionString);
                     connection.Open();
-                    break;
+
+                    Console.Error.WriteLine("Connected to db");
+
+                    using var command = connection.CreateCommand();
+                    command.CommandText = @"
+                        CREATE TABLE IF NOT EXISTS votes (
+                            id VARCHAR(255) NOT NULL,
+                            vote VARCHAR(255) NOT NULL
+                        )";
+                    command.ExecuteNonQuery();
+
+                    return connection;
                 }
                 catch (SocketException)
                 {
@@ -105,23 +122,13 @@ namespace Worker
                     Thread.Sleep(1000);
                 }
             }
-
-            Console.Error.WriteLine("Connected to db");
-
-            var command = connection.CreateCommand();
-            command.CommandText = @"CREATE TABLE IF NOT EXISTS votes (
-                                        id VARCHAR(255) NOT NULL,
-                                        vote VARCHAR(255) NOT NULL
-                                    )";
-            command.ExecuteNonQuery();
-
-            return connection;
         }
 
         private static ConnectionMultiplexer OpenRedisConnection(string hostname)
         {
-            // Use IP address to workaround https://github.com/StackExchange/StackExchange.Redis/issues/410
+            // Resolve a hostname only when the setting is not already an IP address.
             var ipAddress = GetIp(hostname);
+
             Console.WriteLine($"Found redis at {ipAddress}");
 
             while (true)
@@ -129,7 +136,7 @@ namespace Worker
                 try
                 {
                     Console.Error.WriteLine("Connecting to redis");
-                    return ConnectionMultiplexer.Connect(ipAddress);
+                    return ConnectionMultiplexer.Connect($"{ipAddress}:6379");
                 }
                 catch (RedisConnectionException)
                 {
@@ -140,30 +147,43 @@ namespace Worker
         }
 
         private static string GetIp(string hostname)
-            => Dns.GetHostEntryAsync(hostname)
-                .Result
+        {
+            if (IPAddress.TryParse(hostname, out var ipAddress))
+            {
+                return ipAddress.ToString();
+            }
+
+            return Dns.GetHostEntryAsync(hostname)
+                .GetAwaiter()
+                .GetResult()
                 .AddressList
                 .First(a => a.AddressFamily == AddressFamily.InterNetwork)
                 .ToString();
+        }
 
-        private static void UpdateVote(NpgsqlConnection connection, string voterId, string vote)
+        private static void UpdateVote(
+            NpgsqlConnection connection,
+            string voterId,
+            string vote)
         {
-            var command = connection.CreateCommand();
+            using var command = connection.CreateCommand();
+
             try
             {
-                command.CommandText = "INSERT INTO votes (id, vote) VALUES (@id, @vote)";
+                command.CommandText =
+                    "INSERT INTO votes (id, vote) VALUES (@id, @vote)";
                 command.Parameters.AddWithValue("@id", voterId);
                 command.Parameters.AddWithValue("@vote", vote);
                 command.ExecuteNonQuery();
             }
             catch (DbException)
             {
-                command.CommandText = "UPDATE votes SET vote = @vote WHERE id = @id";
+                command.Parameters.Clear();
+                command.CommandText =
+                    "UPDATE votes SET vote = @vote WHERE id = @id";
+                command.Parameters.AddWithValue("@id", voterId);
+                command.Parameters.AddWithValue("@vote", vote);
                 command.ExecuteNonQuery();
-            }
-            finally
-            {
-                command.Dispose();
             }
         }
     }

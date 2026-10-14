@@ -1,0 +1,29 @@
+
+---
+- name: Deploy Vote and Result on frontend
+  hosts: webserver
+  become: true
+
+  tasks:
+    - name: Run Vote container
+      community.docker.docker_container:
+        name: vote
+        image: pokfinner/vote:latest
+        state: started
+        restart_policy: unless-stopped
+        published_ports:
+          - "8080:80"
+        env:
+          REDIS_HOST: "10.0.2.15"
+          REDIS_PORT: "6379"
+
+    - name: Run Result container
+      community.docker.docker_container:
+        name: result
+        image: pokfinner/result:latest
+        state: started
+        restart_policy: unless-stopped
+        published_ports:
+          - "8081:80"
+        env:
+          PG_HOST: "10.0.2.66"

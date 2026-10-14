@@ -1,0 +1,28 @@
+---
+- name: Deploy Redis and Worker on backend
+  hosts: backend
+  become: true
+
+  tasks:
+    - name: Run Redis container
+      community.docker.docker_container:
+        name: redis
+        image: redis:alpine
+        state: started
+        recreate: true
+        restart_policy: unless-stopped
+        published_ports:
+          - "6379:6379"
+
+    - name: Run Worker container
+      community.docker.docker_container:
+        name: worker
+        image: sudharanipanchangam/worker:latest
+        state: started
+        restart_policy: unless-stopped
+        env:
+          REDIS_HOST: "10.0.2.15"
+          DB_HOST: "10.0.2.66"
+          DB_USERNAME: "postgres"
+          DB_PASSWORD: "postgres"
+          DB_NAME: "postgres"
